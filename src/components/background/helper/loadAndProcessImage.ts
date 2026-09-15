@@ -1,15 +1,35 @@
 import type { CSSFilter } from "@/types/appStore.ts";
 import serializeFilters from "@/utils/dom/serializeFilters.ts";
-import * as THREE from "three";
+import { CanvasTexture, type Texture } from "three";
+
+const MAX_TEXTURE_CACHE = 8;
+const textureCache = new Map<string, Texture>();
+
+export function isTextureInCache(texture: Texture): boolean {
+  for (const cached of textureCache.values()) {
+    if (cached === texture) return true;
+  }
+  return false;
+}
 
 async function loadAndProcessImage(
   url: string | null,
   filter: CSSFilter,
-): Promise<THREE.Texture | null> {
+): Promise<Texture | null> {
   try {
     if (!url) {
       console.warn("No image URL provided");
       return null;
+    }
+
+    const filterKey = `${filter.blur ?? 0}_${filter.saturation ?? 100}_${filter.contrast ?? 100}_${filter.brightness ?? 100}`;
+    const cacheKey = `${url}_${filterKey}`;
+
+    const cached = textureCache.get(cacheKey);
+    if (cached) {
+      textureCache.delete(cacheKey);
+      textureCache.set(cacheKey, cached);
+      return cached;
     }
 
     const image = new Image();
@@ -17,8 +37,10 @@ async function loadAndProcessImage(
     image.crossOrigin = url.startsWith("spotify:") ? null : "anonymous";
     await image.decode();
 
-    const originalSize = Math.min(image.width, image.height);
-    const blurExtent = Math.ceil(3 * 40);
+    const rawSize = Math.min(image.width, image.height);
+    const originalSize = Math.min(rawSize, 384);
+    const blurVal = Math.min(filter.blur ?? 40, 60);
+    const blurExtent = Math.ceil(3 * blurVal);
     const padding = blurExtent * 1.5;
     const expandedSize = originalSize + padding;
 
@@ -35,10 +57,10 @@ async function loadAndProcessImage(
     ctx.clip();
     ctx.drawImage(
       image,
-      (image.width - originalSize) / 2,
-      (image.height - originalSize) / 2,
-      originalSize,
-      originalSize,
+      (image.width - rawSize) / 2,
+      (image.height - rawSize) / 2,
+      rawSize,
+      rawSize,
       0,
       0,
       originalSize,
@@ -55,8 +77,19 @@ async function loadAndProcessImage(
     blurredCtx.filter = serializeFilters(filter, { skipOpacity: true });
     blurredCtx.drawImage(circleCanvas, padding / 2, padding / 2);
 
-    const texture = new THREE.CanvasTexture(blurredCanvas);
+    const texture = new CanvasTexture(blurredCanvas);
     texture.needsUpdate = true;
+
+    if (textureCache.size >= MAX_TEXTURE_CACHE) {
+      const oldestKey = textureCache.keys().next().value;
+      if (oldestKey) {
+        const oldTex = textureCache.get(oldestKey);
+        oldTex?.dispose();
+        textureCache.delete(oldestKey);
+      }
+    }
+    textureCache.set(cacheKey, texture);
+
     return texture;
   } catch (err) {
     console.error("Failed to load/process image:", err);

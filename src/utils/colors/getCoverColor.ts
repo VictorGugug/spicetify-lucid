@@ -1,9 +1,75 @@
 import type { ExtractedColor } from "@/utils/graphql/getters.ts";
 import { getExtractedColors } from "@/utils/graphql/getters.ts";
 
+const MAX_COVER_CACHE = 150;
+const coverColorCache = new Map<string, ExtractedColor>();
+const pendingRequests = new Map<string, Promise<ExtractedColor | undefined>>();
+
 export async function getCoverColor(imageUrl: string): Promise<ExtractedColor | undefined> {
+  if (!imageUrl) return undefined;
+
+  if (coverColorCache.has(imageUrl)) {
+    const cached = coverColorCache.get(imageUrl);
+    coverColorCache.delete(imageUrl);
+    if (cached) coverColorCache.set(imageUrl, cached);
+    return cached;
+  }
+
+  if (pendingRequests.has(imageUrl)) {
+    return pendingRequests.get(imageUrl);
+  }
+
+  const promise = extractColorInternal(imageUrl)
+    .then((result) => {
+      pendingRequests.delete(imageUrl);
+      if (result) {
+        if (coverColorCache.size >= MAX_COVER_CACHE) {
+          const oldest = coverColorCache.keys().next().value;
+          if (oldest) coverColorCache.delete(oldest);
+        }
+        coverColorCache.set(imageUrl, result);
+      }
+      return result;
+    })
+    .catch(() => {
+      pendingRequests.delete(imageUrl);
+      return undefined;
+    });
+
+  pendingRequests.set(imageUrl, promise);
+  return promise;
+}
+
+let shared1x1CanvasCtx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null = null;
+
+function getShared1x1Context(): CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D | null {
+  if (shared1x1CanvasCtx) return shared1x1CanvasCtx;
+  if (typeof OffscreenCanvas !== "undefined") {
+    const canvas = new OffscreenCanvas(1, 1);
+    shared1x1CanvasCtx = canvas.getContext("2d", { willReadFrequently: true });
+  } else {
+    const canvas = document.createElement("canvas");
+    canvas.width = 1;
+    canvas.height = 1;
+    shared1x1CanvasCtx = canvas.getContext("2d", { willReadFrequently: true });
+  }
+  return shared1x1CanvasCtx;
+}
+
+async function extractColorInternal(imageUrl: string): Promise<ExtractedColor | undefined> {
   try {
-    const spotifyColors = await getExtractedColors([imageUrl]);
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    const timeoutPromise = new Promise<null>((_, reject) => {
+      timeoutId = setTimeout(() => reject(new Error("GraphQL color extraction timeout")), 750);
+    });
+
+    const spotifyColors = await Promise.race([
+      getExtractedColors([imageUrl]),
+      timeoutPromise,
+    ]).finally(() => {
+      if (timeoutId) clearTimeout(timeoutId);
+    });
+
     const extracted = spotifyColors?.data?.extractedColors?.[0];
 
     if (extracted && !extracted.colorRaw?.fallback) {
@@ -49,14 +115,10 @@ async function extractCanvasColor(imageUrl: string): Promise<ExtractedColor | un
 
     img.onload = () => {
       try {
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const ctx = getShared1x1Context();
         if (!ctx) return resolve(undefined);
 
-        canvas.width = 1;
-        canvas.height = 1;
         ctx.drawImage(img, 0, 0, 1, 1);
-
         const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
 
         resolve({

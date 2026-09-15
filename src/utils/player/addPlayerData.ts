@@ -9,8 +9,17 @@ const scheduleIdle =
     ? requestIdleCallback
     : (cb: () => void) => setTimeout(cb, 50);
 
+let lastHandledUrl = "";
+let isUpdatingQueue = false;
+
 async function addPlayerData(playerData?: typeof Spicetify.Player.data) {
-  const data = playerData ?? (await waitForGlobal(() => Spicetify?.Player?.data));
+  const data =
+    playerData ??
+    (await waitForGlobal(() => {
+      const d = Spicetify?.Player?.data;
+      return d?.item ? d : undefined;
+    }, { timeout: 5000, interval: 100 }).catch(() => Spicetify?.Player?.data));
+  if (!data?.item) return;
 
   const getImageUrl = (item?: typeof data.item | null) => {
     const images = item?.images;
@@ -19,65 +28,91 @@ async function addPlayerData(playerData?: typeof Spicetify.Player.data) {
 
   const currentUrl = getImageUrl(data.item);
   if (!currentUrl) return;
-  const currentColors = await getCoverColor(currentUrl);
+
+  const isSameTrack = currentUrl === lastHandledUrl;
+  lastHandledUrl = currentUrl;
   document.body.style.setProperty("--np-img-url", `url("${currentUrl}")`);
+
+  const prevColors = isSameTrack ? tempStore.getState().player?.current?.colors : undefined;
   tempStore.getState().setPlayer({
     current: {
       url: currentUrl,
-      colors: currentColors,
+      colors: prevColors,
       data: data.item,
     },
   });
 
+  if (!prevColors) {
+    getCoverColor(currentUrl).then((colors) => {
+      if (tempStore.getState().player?.current?.url === currentUrl) {
+        tempStore.getState().setPlayer({
+          current: {
+            url: currentUrl,
+            colors,
+            data: data.item,
+          },
+        });
+      }
+    });
+  }
+
   const { isDark, isTinted, mode } = appStore.getState().color;
   const stableCurrentUrl = currentUrl;
 
-  const loadItems = async (items?: (typeof data.item)[]) => {
-    return (
-      await Promise.all(
-        items?.map(async (item) => {
-          const url = getImageUrl(item);
-          if (!url) return null;
-          const colors = await getCoverColor(url);
-          return {
-            url,
-            colors,
-            data: item,
-          };
-        }) ?? [],
-      )
-    ).filter(Boolean) as PlayerData[];
-  };
+  scheduleIdle(async () => {
+    if (tempStore.getState().player?.current?.url !== stableCurrentUrl) return;
 
-  const prev = await loadItems(data.previousItems?.slice(-2));
-  const next = await loadItems(data.nextItems?.slice(0, 2));
+    const showNextCard = appStore.getState().player?.nextSongCard?.show ?? true;
+    let next: PlayerData[] = [];
 
-  tempStore.getState().setPlayer({
-    prev,
-    next,
-  });
-
-  if (mode !== "dynamic") return;
-
-  [...prev, ...next].forEach((track) => {
-    const hex = track?.colors?.colorRaw?.hex;
-    if (!hex) return;
-
-    scheduleIdle(() => {
-      const latestUrl = tempStore.getState().player?.current?.url;
-      if (latestUrl === stableCurrentUrl) {
-        cacheColorInBackground(hex, isDark, isTinted);
+    if (showNextCard && data.nextItems?.length) {
+      const nextItem = data.nextItems[0];
+      const nextUrl = getImageUrl(nextItem);
+      if (nextUrl) {
+        const colors = await getCoverColor(nextUrl);
+        next = [{ url: nextUrl, colors, data: nextItem }];
       }
-    });
+    }
+
+    if (tempStore.getState().player?.current?.url === stableCurrentUrl) {
+      tempStore.getState().setPlayer({ next });
+
+      if (mode === "dynamic" && next.length > 0) {
+        const hex = next[0]?.colors?.colorRaw?.hex;
+        if (hex) {
+          scheduleIdle(() => {
+            if (tempStore.getState().player?.current?.url === stableCurrentUrl) {
+              cacheColorInBackground(hex, isDark, isTinted);
+            }
+          });
+        }
+      }
+    }
   });
 }
 
-waitForGlobal(() => Spicetify?.Player).then((player) =>
-  player.addEventListener("songchange", (e) => addPlayerData(e?.data)),
-);
+waitForGlobal(() => Spicetify?.Player)
+  .then((player) => {
+    player?.addEventListener("songchange", (e: any) => addPlayerData(e?.data));
+    player?.addEventListener("onplaypause", () => {
+      if (!tempStore.getState().player?.current?.url) {
+        addPlayerData();
+      }
+    });
+  })
+  .catch(() => {});
 
-waitForGlobal(() => Spicetify?.Platform?.PlayerAPI?._queue?._events).then((events) =>
-  events?.addListener("queue_update", () => addPlayerData()),
-);
+waitForGlobal(() => Spicetify?.Platform?.PlayerAPI?._queue?._events)
+  .then((events) =>
+    events?.addListener("queue_update", () => {
+      if (isUpdatingQueue) return;
+      isUpdatingQueue = true;
+      setTimeout(() => {
+        isUpdatingQueue = false;
+        addPlayerData();
+      }, 500);
+    }),
+  )
+  .catch(() => {});
 
 export default addPlayerData;

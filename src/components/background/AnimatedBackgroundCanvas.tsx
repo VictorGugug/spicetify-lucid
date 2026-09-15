@@ -1,35 +1,52 @@
 import { FragmentShader, GetShaderUniforms, VertexShader } from "@/shader/animatedBg.ts";
-import loadAndProcessImage from "@/components/background/helper/loadAndProcessImage.ts";
+import loadAndProcessImage, {
+  isTextureInCache,
+} from "@/components/background/helper/loadAndProcessImage.ts";
 import appStore from "@/store/appStore.ts";
 import waitForGlobal from "@/utils/dom/waitForGlobal.ts";
 import { useEffect, useRef } from "react";
-import * as THREE from "three";
+import {
+  Mesh,
+  OrthographicCamera,
+  PlaneGeometry,
+  Scene,
+  ShaderMaterial,
+  WebGLRenderer,
+} from "three";
 import { useStore } from "zustand";
+import { useShallow } from "zustand/react/shallow";
 
 const AnimatedBackgroundCanvas: React.FC<{ imageSrc: string | null }> = ({ imageSrc }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
+  const rendererRef = useRef<WebGLRenderer | null>(null);
   const uniformsRef = useRef<ReturnType<typeof GetShaderUniforms> | null>(null);
+  const sceneRef = useRef<Scene | null>(null);
+  const cameraRef = useRef<OrthographicCamera | null>(null);
   const isFocusedRef = useRef(true);
-  const { filter, autoStopAnimation } = useStore(appStore, (state) => state.bg.options);
+  const updateAnimationStateRef = useRef<() => void>(() => {});
+  const { filter, autoStopAnimation } = useStore(appStore, useShallow((state) => state.bg.options));
 
   useEffect(() => {
     if (!canvasRef.current) return;
 
-    const scene = new THREE.Scene();
-    const renderer = new THREE.WebGLRenderer({
+    const scene = new Scene();
+    sceneRef.current = scene;
+    const renderer = new WebGLRenderer({
       canvas: canvasRef.current,
-      antialias: true,
-      alpha: true,
+      antialias: false,
+      alpha: false,
+      powerPreference: "low-power",
     });
-    renderer.setPixelRatio(window.devicePixelRatio);
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, 1.0);
+    renderer.setPixelRatio(pixelRatio);
     renderer.setSize(window.innerWidth, window.innerHeight);
     rendererRef.current = renderer;
 
-    const camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
+    const camera = new OrthographicCamera(-1, 1, 1, -1, 0.1, 10);
     camera.position.z = 1;
+    cameraRef.current = camera;
 
-    const geometry = new THREE.PlaneGeometry(2, 2);
+    const geometry = new PlaneGeometry(2, 2);
     const uniforms = GetShaderUniforms();
     uniformsRef.current = uniforms;
 
@@ -38,8 +55,9 @@ const AnimatedBackgroundCanvas: React.FC<{ imageSrc: string | null }> = ({ image
       const height = window.innerHeight;
       renderer.setSize(width, height);
 
-      const scaledWidth = width * window.devicePixelRatio;
-      const scaledHeight = height * window.devicePixelRatio;
+      const pr = Math.min(window.devicePixelRatio || 1, 1.0);
+      const scaledWidth = width * pr;
+      const scaledHeight = height * pr;
       const largestAxis = scaledWidth > scaledHeight ? "X" : "Y";
       const largestAxisSize = Math.max(scaledWidth, scaledHeight);
 
@@ -55,67 +73,140 @@ const AnimatedBackgroundCanvas: React.FC<{ imageSrc: string | null }> = ({ image
       uniforms.RightCircleOrigin.value.set(scaledWidth, 0);
       uniforms.RightCircleRadius.value = largestAxisSize * (largestAxis === "X" ? 0.65 : 0.5);
 
-      renderer.render(scene, camera); // render once when resizing else the background will be black
+      renderer.render(scene, camera);
     };
 
     UpdateDimensions();
 
-    const material = new THREE.ShaderMaterial({
+    const material = new ShaderMaterial({
       vertexShader: VertexShader,
       fragmentShader: FragmentShader,
       uniforms,
       transparent: true,
     });
 
-    const mesh = new THREE.Mesh(geometry, material);
+    const mesh = new Mesh(geometry, material);
     scene.add(mesh);
 
     let frameId: number | null = null;
-    let hasRenderedOnce = false;
-    const animate = () => {
-      const time = performance.now() / 3500;
-      uniforms.Time.value = time;
+    let isRunning = false;
+    let lastFrameTime = performance.now();
+    const targetFps = 30;
+    const frameInterval = 1000 / targetFps;
 
-      if (isFocusedRef.current || !hasRenderedOnce) {
-        renderer.render(scene, camera);
-        hasRenderedOnce = true;
+    const startLoop = () => {
+      if (isRunning) return;
+      isRunning = true;
+      lastFrameTime = performance.now();
+      animate();
+    };
+
+    const stopLoop = () => {
+      if (!isRunning) return;
+      isRunning = false;
+      if (frameId) {
+        cancelAnimationFrame(frameId);
+        frameId = null;
       }
+    };
 
+    const animate = () => {
+      if (!isRunning) return;
+      const now = performance.now();
+      const delta = now - lastFrameTime;
+
+      if (delta >= frameInterval) {
+        lastFrameTime = now - (delta % frameInterval);
+        const time = now / 3500;
+        uniforms.Time.value = time;
+        renderer.render(scene, camera);
+      }
       frameId = requestAnimationFrame(animate);
     };
-    animate(); // start animation loop
 
+    const updateAnimationState = () => {
+      const isHidden = typeof document !== "undefined" && document.hidden;
+      const shouldPause =
+        isHidden || (appStore.getState().bg.options.autoStopAnimation && !isFocusedRef.current);
+      if (shouldPause) {
+        stopLoop();
+        renderer.render(scene, camera);
+      } else {
+        startLoop();
+      }
+    };
+
+    updateAnimationStateRef.current = updateAnimationState;
+
+    renderer.render(scene, camera);
+    updateAnimationState();
+
+    const handleVisibility = () => {
+      updateAnimationState();
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("resize", UpdateDimensions);
 
+    const onPlayPauseHandler = () => updateAnimationState();
+    waitForGlobal(() => Spicetify?.Player)
+      .then((player) => player?.addEventListener("onplaypause", onPlayPauseHandler))
+      .catch(() => {});
+
     return () => {
-      if (frameId) cancelAnimationFrame(frameId);
+      stopLoop();
       renderer.dispose();
       geometry.dispose();
       material.dispose();
+      rendererRef.current = null;
+      sceneRef.current = null;
+      cameraRef.current = null;
+
+      if (typeof Spicetify?.Player?.removeEventListener === "function") {
+        try {
+          Spicetify.Player.removeEventListener("onplaypause", onPlayPauseHandler);
+        } catch {}
+      }
+      
+      // Dispose uniform textures
+      if (uniformsRef.current) {
+        const u = uniformsRef.current;
+        if (u.BlurredCoverArt.value && typeof u.BlurredCoverArt.value.dispose === 'function') {
+          if (!isTextureInCache(u.BlurredCoverArt.value)) u.BlurredCoverArt.value.dispose();
+        }
+        if (u.PreviousBlurredCoverArt.value && typeof u.PreviousBlurredCoverArt.value.dispose === 'function') {
+          if (!isTextureInCache(u.PreviousBlurredCoverArt.value)) u.PreviousBlurredCoverArt.value.dispose();
+        }
+      }
+
       window.removeEventListener("resize", UpdateDimensions);
+      document.removeEventListener("visibilitychange", handleVisibility);
     };
   }, []);
 
   useEffect(() => {
     const handleFocus = () => {
       isFocusedRef.current = true;
+      updateAnimationStateRef.current();
     };
 
     const handleBlur = () => {
       isFocusedRef.current = false;
+      updateAnimationStateRef.current();
     };
 
-    waitForGlobal<any>(() => window?._spicy_lyrics?.fullscreen).then((fullscreen) =>
-      fullscreen?.onopen(handleBlur),
-    );
-    waitForGlobal<any>(() => window?._spicy_lyrics?.fullscreen).then((fullscreen) =>
-      fullscreen?.onclose(handleFocus),
-    );
+    waitForGlobal<any>(() => window?._spicy_lyrics?.fullscreen)
+      .then((fullscreen) => fullscreen?.onopen?.(handleBlur))
+      .catch(() => {});
+    waitForGlobal<any>(() => window?._spicy_lyrics?.fullscreen)
+      .then((fullscreen) => fullscreen?.onclose?.(handleFocus))
+      .catch(() => {});
 
     if (autoStopAnimation) {
       window.addEventListener("focus", handleFocus);
       window.addEventListener("blur", handleBlur);
     }
+
+    updateAnimationStateRef.current();
 
     return () => {
       window.removeEventListener("focus", handleFocus);
@@ -130,43 +221,61 @@ const AnimatedBackgroundCanvas: React.FC<{ imageSrc: string | null }> = ({ image
     const prevTexture = uniforms.BlurredCoverArt.value;
 
     uniforms.PreviousBlurredCoverArt.value = prevTexture;
-
     uniforms.TextureFade.value = 0;
 
     let cancelled = false;
+    let fadeFrameId: number | null = null;
 
-    setTimeout(() => {
-      loadAndProcessImage(imageSrc, filter).then((newTexture) => {
-        if (!newTexture || cancelled || !uniformsRef.current) return;
+    loadAndProcessImage(imageSrc, filter).then((newTexture) => {
+      if (!newTexture) return;
 
-        uniforms.BlurredCoverArt.value = newTexture;
+      if (cancelled || !uniformsRef.current) {
+        if (!isTextureInCache(newTexture)) {
+          newTexture.dispose();
+        }
+        return;
+      }
 
-        const start = performance.now();
-        const duration = 800;
+      uniforms.BlurredCoverArt.value = newTexture;
+      if (rendererRef.current && sceneRef.current && cameraRef.current) {
+        rendererRef.current.render(sceneRef.current, cameraRef.current);
+      }
 
-        const fade = () => {
-          if (!uniformsRef.current) return;
+      const start = performance.now();
+      const duration = 500;
 
-          const elapsed = performance.now() - start;
+      const fade = () => {
+        if (cancelled || !uniformsRef.current) return;
 
-          const t = Math.min(elapsed / duration, 1);
-          uniformsRef.current.TextureFade.value = t;
+        const elapsed = performance.now() - start;
+        const t = Math.min(elapsed / duration, 1);
+        uniformsRef.current.TextureFade.value = t;
 
-          if (t < 1) {
-            requestAnimationFrame(fade);
-          } else {
-            if (prevTexture && prevTexture !== uniformsRef.current.BlurredCoverArt.value) {
-              prevTexture.dispose();
-            }
+        if (rendererRef.current && sceneRef.current && cameraRef.current) {
+          rendererRef.current.render(sceneRef.current, cameraRef.current);
+        }
+
+        if (t < 1) {
+          fadeFrameId = requestAnimationFrame(fade);
+        } else {
+          if (
+            prevTexture &&
+            prevTexture !== uniformsRef.current.BlurredCoverArt.value &&
+            !isTextureInCache(prevTexture)
+          ) {
+            prevTexture.dispose();
           }
-        };
+        }
+      };
 
-        fade();
-      });
-    }, 300);
+      fade();
+    });
 
     return () => {
       cancelled = true;
+      if (fadeFrameId) {
+        cancelAnimationFrame(fadeFrameId);
+      }
     };
   }, [imageSrc, filter]);
 
